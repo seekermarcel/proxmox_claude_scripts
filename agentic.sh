@@ -23,6 +23,12 @@ success() { echo -e "${GREEN}[OK]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+validate_integer() {
+  local val=$1 name=$2 min=$3 max=$4
+  [[ "$val" =~ ^[0-9]+$ ]] || error "$name must be a positive integer."
+  (( val >= min && val <= max )) || error "$name must be between $min and $max."
+}
+
 header() {
   echo ""
   echo -e "${BOLD}╔══════════════════════════════════════════════════╗${NC}"
@@ -44,6 +50,19 @@ get_config() {
   local next_id
   next_id=$(pvesh get /cluster/nextid 2>/dev/null || echo "100")
 
+  # Auto-detect sensible defaults
+  local default_storage default_bridge default_tz
+  default_storage=$(pvesm status 2>/dev/null | awk 'NR>1 && $3=="active" {print $1; exit}')
+  [[ -n "$default_storage" ]] || default_storage="local-lvm"
+
+  default_bridge=$(ip link show type bridge 2>/dev/null \
+    | awk -F': ' '/^[0-9]+:/ {gsub(/@.*/, "", $2); print $2; exit}')
+  [[ -n "$default_bridge" ]] || default_bridge="vmbr0"
+
+  default_tz=$(timedatectl show -p Timezone --value 2>/dev/null \
+    || cat /etc/timezone 2>/dev/null \
+    || echo "Europe/Berlin")
+
   # Template
   TEMPLATE="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"
 
@@ -64,18 +83,29 @@ get_config() {
 
   read -rp "CPU cores [4]: " CT_CORES
   CT_CORES="${CT_CORES:-4}"
+  validate_integer "$CT_CORES" "CPU cores" 1 128
 
   read -rp "RAM in MB [10240]: " CT_RAM
   CT_RAM="${CT_RAM:-10240}"
+  validate_integer "$CT_RAM" "RAM" 512 524288
 
   read -rp "Swap in MB [2048]: " CT_SWAP
   CT_SWAP="${CT_SWAP:-2048}"
+  validate_integer "$CT_SWAP" "Swap" 0 65536
 
   read -rp "Disk size in GB [30]: " CT_DISK
   CT_DISK="${CT_DISK:-30}"
+  validate_integer "$CT_DISK" "Disk" 8 65536
 
-  read -rp "Storage [truenas-lvm]: " CT_STORAGE
-  CT_STORAGE="${CT_STORAGE:-truenas-lvm}"
+  read -rp "Storage [$default_storage]: " CT_STORAGE
+  CT_STORAGE="${CT_STORAGE:-$default_storage}"
+  pvesm status 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$CT_STORAGE" \
+    || error "Storage '$CT_STORAGE' not found. Run 'pvesm status' to list available pools."
+
+  read -rp "Bridge [$default_bridge]: " CT_BRIDGE
+  CT_BRIDGE="${CT_BRIDGE:-$default_bridge}"
+  ip link show "$CT_BRIDGE" &>/dev/null \
+    || warn "Bridge '$CT_BRIDGE' not found via ip link — verify it exists in Proxmox."
 
   # Network - default DHCP
   read -rp "IP address (DHCP or x.x.x.x/xx) [dhcp]: " CT_IP
@@ -89,8 +119,20 @@ get_config() {
   read -rp "DNS server [1.1.1.1]: " CT_DNS
   CT_DNS="${CT_DNS:-1.1.1.1}"
 
+  read -rp "Timezone [$default_tz]: " CT_TZ
+  CT_TZ="${CT_TZ:-$default_tz}"
+
   # SSH key (optional)
   read -rp "Path to SSH public key (optional, press Enter to skip): " CT_SSH_KEY
+  if [[ -n "${CT_SSH_KEY:-}" && -f "$CT_SSH_KEY" ]]; then
+    CT_SSH_KEY_PROVIDED=1
+  else
+    CT_SSH_KEY_PROVIDED=0
+  fi
+
+  read -rsp "Code Server password [admin]: " CT_CODE_PASSWORD
+  echo ""
+  CT_CODE_PASSWORD="${CT_CODE_PASSWORD:-admin}"
 
   echo ""
   echo -e "${BOLD}Summary${NC}"
@@ -102,8 +144,10 @@ get_config() {
   echo "  RAM:        $CT_RAM MB ($(( CT_RAM / 1024 )) GB)"
   echo "  Swap:       $CT_SWAP MB"
   echo "  Disk:       ${CT_DISK}G on $CT_STORAGE"
+  echo "  Bridge:     $CT_BRIDGE"
   echo "  Network:    $CT_IP"
   echo "  DNS:        $CT_DNS"
+  echo "  Timezone:   $CT_TZ"
   echo "─────────────────────────────────────────────────"
   echo ""
   read -rp "Proceed? (y/N): " confirm
@@ -114,7 +158,6 @@ get_config() {
 get_template() {
   info "Checking for template: $TEMPLATE"
 
-  # Download if not already present
   if ! pveam list local 2>/dev/null | grep -q "$TEMPLATE"; then
     info "Downloading $TEMPLATE ..."
     pveam download local "$TEMPLATE" || error "Failed to download template. Run 'pveam update' and try again."
@@ -130,7 +173,7 @@ create_container() {
   info "Creating LXC container $CT_ID..."
 
   # Build network string
-  local net_str="name=eth0,bridge=vmbr0"
+  local net_str="name=eth0,bridge=${CT_BRIDGE}"
   if [[ "$CT_IP" == "dhcp" ]]; then
     net_str+=",ip=dhcp"
   else
@@ -189,22 +232,31 @@ start_container() {
 provision_container() {
   info "Provisioning container (this takes a few minutes)..."
 
-  # Write provision script to host, then push into container
-  cat > /tmp/provision-${CT_ID}.sh << 'PROVISION_EOF'
-#!/bin/bash
-set -e
+  # Write config header — host variables expand here; printf %q handles special chars
+  {
+    printf '#!/bin/bash\nset -e\n'
+    printf 'CT_TZ=%q\n'                "${CT_TZ}"
+    printf 'CODE_SERVER_PASSWORD=%q\n' "${CT_CODE_PASSWORD}"
+    printf 'SSH_KEY_PROVIDED=%q\n'     "${CT_SSH_KEY_PROVIDED}"
+  } > /tmp/provision-${CT_ID}.sh
+
+  # Append provision body — single-quoted heredoc, no host variable expansion.
+  # Container variables (CT_TZ, CODE_SERVER_PASSWORD, SSH_KEY_PROVIDED) defined
+  # above are available when this script runs inside the container.
+  cat >> /tmp/provision-${CT_ID}.sh << 'PROVISION_EOF'
 export DEBIAN_FRONTEND=noninteractive
 
-echo ">>> Setting timezone to America/New_York..."
-ln -sf /usr/share/zoneinfo/America/New_York /etc/localtime
-echo "America/New_York" > /etc/timezone
+echo ">>> Setting timezone to ${CT_TZ}..."
+ln -sf /usr/share/zoneinfo/${CT_TZ} /etc/localtime
+echo "${CT_TZ}" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata
 
 echo ">>> Generating locale..."
 apt-get update -qq
 apt-get install -y -qq locales
 sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen
-locale-gen en_US.UTF-8 > /dev/null 2>&1
+sed -i '/de_DE.UTF-8/s/^# //g' /etc/locale.gen
+locale-gen en_US.UTF-8 de_DE.UTF-8 > /dev/null 2>&1
 update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
@@ -250,6 +302,8 @@ npm install -g typescript ts-node eslint prettier
 
 echo ">>> Installing Go..."
 GO_VERSION=$(curl -fsSL "https://go.dev/VERSION?m=text" | head -1)
+[[ "$GO_VERSION" =~ ^go[0-9]+\.[0-9]+ ]] \
+  || { echo "ERROR: unexpected Go version string: $GO_VERSION"; exit 1; }
 curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
 rm -rf /usr/local/go
 tar -C /usr/local -xzf /tmp/go.tar.gz
@@ -273,7 +327,6 @@ echo "    Compose $(docker compose version --short 2>/dev/null || echo 'included
 
 echo ">>> Installing Claude Code (native installer)..."
 curl -fsSL https://claude.ai/install.sh | bash
-# Ensure claude is on PATH for all sessions
 if [[ -f "$HOME/.local/bin/claude" ]]; then
   ln -sf "$HOME/.local/bin/claude" /usr/local/bin/claude 2>/dev/null || true
 elif [[ -f "$HOME/.claude/bin/claude" ]]; then
@@ -358,7 +411,7 @@ Remote control is enabled for all sessions. Every interactive session is automat
 from claude.ai/code or the Claude mobile app. Use /remote-control or press spacebar to show QR code.
 
 ## Docker Usage
-Docker compose files should go in /docker/<service-name>/docker-compose.yml. 
+Docker compose files should go in /docker/<service-name>/docker-compose.yml.
 Watchtower is already running and will auto-update any containers with `restart: unless-stopped`.
 All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
 
@@ -381,6 +434,7 @@ All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
   - /superpowers:execute-plan — Execute plans in batches via subagents
   - Auto-activating skills: test-driven-development, systematic-debugging, verification-before-completion
 CLAUDEMD
+sed -i "s|America/New_York|${CT_TZ}|g" /project/CLAUDE.md
 
 echo ">>> Installing Claude Code plugins (official marketplace)..."
 npx -y claude-plugins install @anthropics/claude-code-plugins/frontend-design
@@ -401,9 +455,27 @@ cd /root
 echo ">>> Installing Playwright for webapp-testing skill..."
 npx -y playwright install --with-deps chromium
 
+echo ">>> Setting keyboard layout to German..."
+apt-get install -y -qq console-setup keyboard-configuration
+cat > /etc/default/keyboard << 'KEYBOARD'
+XKBMODEL="pc105"
+XKBLAYOUT="de"
+XKBVARIANT=""
+XKBOPTIONS=""
+BACKSPACE="guess"
+KEYBOARD
+
+setupcon --force 2>/dev/null || true
+
 echo ">>> Configuring SSH..."
 sed -i "s/^#*PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
-sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
+if [[ "$SSH_KEY_PROVIDED" == "1" ]]; then
+  sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication no/" /etc/ssh/sshd_config
+  echo "    SSH key auth only (password auth disabled)"
+else
+  sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
+  echo "    SSH password auth enabled (no key provided)"
+fi
 systemctl enable ssh
 systemctl restart ssh
 
@@ -429,6 +501,7 @@ alias dps="docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
 # Always start in /project
 cd /project 2>/dev/null || true
 BASHRC
+sed -i "s|export TZ=America/New_York|export TZ=${CT_TZ}|" /root/.bashrc
 
 echo ">>> Setting up Git defaults..."
 git config --global init.defaultBranch main
@@ -453,6 +526,7 @@ services:
     security_opt:
       - apparmor=unconfined
 DCOMPOSE
+sed -i "s|TZ: America/New_York|TZ: ${CT_TZ}|" /docker/watchtower/docker-compose.yml
 
 mkdir -p /docker/code-server
 cat > /docker/code-server/docker-compose.yml << 'DCOMPOSE2'
@@ -465,7 +539,7 @@ services:
       PUID: "0"
       PGID: "0"
       TZ: America/New_York
-      PASSWORD: admin
+      PASSWORD: __CODE_SERVER_PASSWORD__
     volumes:
       - ./config:/config
       - /:/config/workspace
@@ -474,13 +548,15 @@ services:
     security_opt:
       - apparmor=unconfined
 DCOMPOSE2
+sed -i "s|TZ: America/New_York|TZ: ${CT_TZ}|" /docker/code-server/docker-compose.yml
+sed -i "s|PASSWORD: __CODE_SERVER_PASSWORD__|PASSWORD: ${CODE_SERVER_PASSWORD}|" /docker/code-server/docker-compose.yml
 
 cd /docker/watchtower && docker compose up -d
 cd /docker/code-server && docker compose up -d
 
 echo ">>> Setting up auto-update cron..."
 cat > /etc/cron.d/system-update << 'CRON'
-# Weekly system update - Sunday 3:00 AM ET
+# Weekly system update - Sunday 3:00 AM
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 0 3 * * 0 root apt-get update -qq && apt-get upgrade -y -qq && apt-get autoremove -y -qq && apt-get clean -qq >> /var/log/auto-update.log 2>&1
@@ -511,7 +587,7 @@ PROVISION_EOF
   chmod +x /tmp/provision-${CT_ID}.sh
   pct push "$CT_ID" /tmp/provision-${CT_ID}.sh /tmp/provision.sh
   pct exec "$CT_ID" -- chmod +x /tmp/provision.sh
-  pct exec "$CT_ID" -- /tmp/provision.sh
+  pct exec "$CT_ID" -- bash -c 'set -o pipefail; /tmp/provision.sh 2>&1 | tee /var/log/provision.log'
   rm -f /tmp/provision-${CT_ID}.sh
 }
 
@@ -530,12 +606,13 @@ print_summary() {
   echo -e "  ${BOLD}IP:${NC}         ${ct_ip:-pending (DHCP)}"
   echo -e "  ${BOLD}Resources:${NC}  ${CT_CORES} CPU / $(( CT_RAM / 1024 )) GB RAM / ${CT_DISK} GB disk"
   echo -e "  ${BOLD}Storage:${NC}    $CT_STORAGE"
-  echo -e "  ${BOLD}Timezone:${NC}   America/New_York"
+  echo -e "  ${BOLD}Bridge:${NC}     $CT_BRIDGE"
+  echo -e "  ${BOLD}Timezone:${NC}   $CT_TZ"
   echo ""
   echo -e "  ${BOLD}Connect:${NC}"
   echo -e "    Console:  ${CYAN}pct enter $CT_ID${NC}"
   [[ -n "${ct_ip:-}" ]] && echo -e "    SSH:      ${CYAN}ssh root@${ct_ip}${NC}"
-  [[ -n "${ct_ip:-}" ]] && echo -e "    Code:     ${CYAN}http://${ct_ip}:8443${NC}  (password: admin)"
+  [[ -n "${ct_ip:-}" ]] && echo -e "    Code:     ${CYAN}http://${ct_ip}:8443${NC}"
   echo ""
   echo -e "  ${BOLD}Start Claude Code:${NC}"
   echo -e "    ${CYAN}claude${NC}    (shell auto-cd's to /project on login)"
@@ -553,7 +630,8 @@ print_summary() {
   echo -e "  ${BOLD}Features:${NC}    Agent teams, extended thinking, 64k output tokens, remote control"
   echo -e "  ${BOLD}Plugins:${NC}     frontend-design, code-review, commit-commands,"
   echo -e "               security-guidance, context7, webapp-testing, superpowers"
-  echo -e "  ${BOLD}Auto-updates:${NC} Sundays 3 AM ET (system) / Daily 4 AM ET (Docker)"
+  echo -e "  ${BOLD}Provision log:${NC} /var/log/provision.log (inside container)"
+  echo -e "  ${BOLD}Auto-updates:${NC} Sundays 3 AM (system) / Daily 4 AM (Docker) — TZ: $CT_TZ"
   echo ""
 }
 
