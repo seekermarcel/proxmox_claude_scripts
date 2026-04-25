@@ -364,16 +364,7 @@ cat > /root/.claude/settings.json << 'SETTINGS'
     "MAX_THINKING_TOKENS": "31999"
   },
   "alwaysThinkingEnabled": true,
-  "enableRemoteControl": true,
-  "enabledPlugins": {
-    "frontend-design@claude-code-plugins": true,
-    "code-review@claude-code-plugins": true,
-    "commit-commands@claude-code-plugins": true,
-    "security-guidance@claude-code-plugins": true,
-    "context7@claude-plugin-directory": true,
-    "webapp-testing@anthropic-agent-skills": true,
-    "superpowers@superpowers-marketplace": true
-  }
+  "enableRemoteControl": true
 }
 SETTINGS
 
@@ -426,23 +417,27 @@ All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
 - **code-review**: Multi-agent PR review with confidence scoring
 - **commit-commands**: Git commit, push, and PR workflows (/commit, /push, /pr)
 - **security-guidance**: Security warnings when editing sensitive files
-- **context7**: Live, version-specific library docs lookup (reduces API hallucinations)
-- **webapp-testing**: Playwright-based browser testing for UI verification and debugging
+- **context7**: Live, version-specific library docs lookup — reduces API hallucinations
 - **superpowers**: Development workflow framework — brainstorm → plan → implement with TDD
   - /superpowers:brainstorm — Refine ideas before coding
   - /superpowers:write-plan — Create implementation plans
   - /superpowers:execute-plan — Execute plans in batches via subagents
-  - Auto-activating skills: test-driven-development, systematic-debugging, verification-before-completion
+
+## Installed Skills
+- **webapp-testing**: Playwright-based browser testing for UI verification and debugging
 CLAUDEMD
 sed -i "s|America/New_York|${CT_TZ}|g" /project/CLAUDE.md
 
-echo ">>> Installing Claude Code plugins (official marketplace)..."
-npx -y claude-plugins install @anthropics/claude-code-plugins/frontend-design
-npx -y claude-plugins install @anthropics/claude-code-plugins/code-review
-npx -y claude-plugins install @anthropics/claude-code-plugins/commit-commands
-npx -y claude-plugins install @anthropics/claude-code-plugins/security-guidance
-npx -y claude-plugins install @anthropics/claude-plugins-official/context7
-npx -y claude-plugins install @obra/superpowers-marketplace/superpowers
+echo ">>> Installing Claude Code plugins..."
+# Ensure claude is on PATH regardless of which install location was used
+export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH"
+claude plugin marketplace add anthropics/claude-plugins-official
+claude plugin install frontend-design@claude-plugins-official
+claude plugin install code-review@claude-plugins-official
+claude plugin install commit-commands@claude-plugins-official
+claude plugin install security-guidance@claude-plugins-official
+claude plugin install context7@claude-plugins-official
+claude plugin install superpowers@claude-plugins-official
 
 echo ">>> Installing webapp-testing skill (from anthropics/skills)..."
 git clone --depth 1 --filter=blob:none --sparse https://github.com/anthropics/skills.git /tmp/anthropic-skills
@@ -629,7 +624,8 @@ print_summary() {
   echo -e "  ${BOLD}Config:${NC}      ~/.claude/settings.json"
   echo -e "  ${BOLD}Features:${NC}    Agent teams, extended thinking, 64k output tokens, remote control"
   echo -e "  ${BOLD}Plugins:${NC}     frontend-design, code-review, commit-commands,"
-  echo -e "               security-guidance, context7, webapp-testing, superpowers"
+  echo -e "               security-guidance, context7, superpowers"
+  echo -e "  ${BOLD}Skills:${NC}      webapp-testing (Playwright)"
   echo -e "  ${BOLD}Provision log:${NC} /var/log/provision.log (inside container)"
   echo -e "  ${BOLD}Auto-updates:${NC} Sundays 3 AM (system) / Daily 4 AM (Docker) — TZ: $CT_TZ"
   echo ""
