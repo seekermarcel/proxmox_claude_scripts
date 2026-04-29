@@ -134,6 +134,13 @@ get_config() {
   echo ""
   CT_CODE_PASSWORD="${CT_CODE_PASSWORD:-admin}"
 
+  # GitHub credentials for WUD to query lscr.io (needs read:packages scope)
+  read -rp "GitHub username for WUD lscr.io registry (optional): " CT_GITHUB_USER
+  CT_GITHUB_USER="${CT_GITHUB_USER:-}"
+  read -rsp "GitHub token for WUD lscr.io registry (read:packages scope, optional): " CT_GITHUB_TOKEN
+  echo ""
+  CT_GITHUB_TOKEN="${CT_GITHUB_TOKEN:-}"
+
   echo ""
   echo -e "${BOLD}Summary${NC}"
   echo "─────────────────────────────────────────────────"
@@ -238,6 +245,8 @@ provision_container() {
     printf 'CT_TZ=%q\n'                "${CT_TZ}"
     printf 'CODE_SERVER_PASSWORD=%q\n' "${CT_CODE_PASSWORD}"
     printf 'SSH_KEY_PROVIDED=%q\n'     "${CT_SSH_KEY_PROVIDED}"
+    printf 'GITHUB_USER=%q\n'          "${CT_GITHUB_USER}"
+    printf 'GITHUB_TOKEN=%q\n'         "${CT_GITHUB_TOKEN}"
   } > /tmp/provision-${CT_ID}.sh
 
   # Append provision body — single-quoted heredoc, no host variable expansion.
@@ -384,7 +393,7 @@ cat > /project/CLAUDE.md << 'CLAUDEMD'
 - **Languages**: Node.js 22 LTS, Python 3.12, Go (latest), Rust (latest)
 - **Package managers**: npm, pip (use --break-system-packages), cargo, go install
 - **Docker**: Docker Engine + Compose plugin, running and ready
-- **Containers**: Watchtower (auto-updates), Code Server (port 8443)
+- **Containers**: WUD - What's Up Docker (update monitor, port 3000), Code Server (port 8443)
 - **Search tools**: ripgrep (rg), fd-find (fdfind), fzf
 - **Databases**: PostgreSQL client (psql), Redis client (redis-cli), SQLite3
 
@@ -403,7 +412,7 @@ from claude.ai/code or the Claude mobile app. Use /remote-control or press space
 
 ## Docker Usage
 Docker compose files should go in /docker/<service-name>/docker-compose.yml.
-Watchtower is already running and will auto-update any containers with `restart: unless-stopped`.
+WUD is already running and monitors containers for updates. Access the WUD dashboard at port 3000.
 All Docker containers in this LXC need `security_opt: [apparmor=unconfined]`.
 
 ## Conventions
@@ -504,24 +513,28 @@ git config --global core.editor nano
 git config --global pull.rebase false
 
 echo ">>> Setting up Docker services..."
-mkdir -p /docker/watchtower
-cat > /docker/watchtower/docker-compose.yml << 'DCOMPOSE'
+mkdir -p /docker/wud
+cat > /docker/wud/docker-compose.yml << 'DCOMPOSE'
 services:
-  watchtower:
-    image: containrrr/watchtower
-    container_name: watchtower
+  wud:
+    image: getwud/wud
+    container_name: wud
     restart: unless-stopped
     environment:
       TZ: America/New_York
-      WATCHTOWER_CLEANUP: "true"
-      WATCHTOWER_INCLUDE_STOPPED: "true"
-      WATCHTOWER_SCHEDULE: "0 0 4 * * *"
+      WUD_WATCHER_LOCAL_CRON: "0 4 * * *"
+      WUD_REGISTRY_LSCR_1_USERNAME: __GITHUB_USER__
+      WUD_REGISTRY_LSCR_1_TOKEN: __GITHUB_TOKEN__
+    ports:
+      - 3000:3000
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     security_opt:
       - apparmor=unconfined
 DCOMPOSE
-sed -i "s|TZ: America/New_York|TZ: ${CT_TZ}|" /docker/watchtower/docker-compose.yml
+sed -i "s|TZ: America/New_York|TZ: ${CT_TZ}|" /docker/wud/docker-compose.yml
+sed -i "s|WUD_REGISTRY_LSCR_1_USERNAME: __GITHUB_USER__|WUD_REGISTRY_LSCR_1_USERNAME: ${GITHUB_USER}|" /docker/wud/docker-compose.yml
+sed -i "s|WUD_REGISTRY_LSCR_1_TOKEN: __GITHUB_TOKEN__|WUD_REGISTRY_LSCR_1_TOKEN: ${GITHUB_TOKEN}|" /docker/wud/docker-compose.yml
 
 mkdir -p /docker/code-server
 cat > /docker/code-server/docker-compose.yml << 'DCOMPOSE2'
@@ -546,7 +559,7 @@ DCOMPOSE2
 sed -i "s|TZ: America/New_York|TZ: ${CT_TZ}|" /docker/code-server/docker-compose.yml
 sed -i "s|PASSWORD: __CODE_SERVER_PASSWORD__|PASSWORD: ${CODE_SERVER_PASSWORD}|" /docker/code-server/docker-compose.yml
 
-cd /docker/watchtower && docker compose up -d
+cd /docker/wud && docker compose up -d
 cd /docker/code-server && docker compose up -d
 
 echo ">>> Setting up auto-update cron..."
@@ -617,7 +630,7 @@ print_summary() {
   echo "    • Python 3 + pip + venv   • Go (latest)"
   echo "    • Rust (via rustup)       • Docker + Compose"
   echo "    • Git, ripgrep, fzf, fd   • Build essentials"
-  echo "    • PostgreSQL & Redis CLI  • Watchtower (auto-update containers)"
+  echo "    • PostgreSQL & Redis CLI  • WUD - What's Up Docker (port 3000)"
   echo "    • Code Server (port 8443)"
   echo ""
   echo -e "  ${BOLD}Permissions:${NC}  All tools pre-approved (no prompts)"
@@ -627,7 +640,7 @@ print_summary() {
   echo -e "               security-guidance, context7, superpowers"
   echo -e "  ${BOLD}Skills:${NC}      webapp-testing (Playwright)"
   echo -e "  ${BOLD}Provision log:${NC} /var/log/provision.log (inside container)"
-  echo -e "  ${BOLD}Auto-updates:${NC} Sundays 3 AM (system) / Daily 4 AM (Docker) — TZ: $CT_TZ"
+  echo -e "  ${BOLD}Auto-updates:${NC} Sundays 3 AM (system) / Daily 4 AM (WUD check) — TZ: $CT_TZ"
   echo ""
 }
 
